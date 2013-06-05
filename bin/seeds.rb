@@ -13,6 +13,10 @@ require 'securerandom'
 private_int = 'PRIV_INTERFACE'
 public_int  = 'PUB_INTERFACE'
 
+# Changes from upstream:
+#  - EPEL removed
+#  - SELinux enforcing
+#  - puppet removed from %packages
 # Template texts - the trailing newline is important!
 provision_text='install
 <%= @mediapath %>
@@ -23,37 +27,28 @@ skipx
 network --bootproto <%= @static ? "static" : "dhcp" %> --hostname <%= @host %>
 rootpw --iscrypted <%= root_pass %>
 firewall --<%= @host.operatingsystem.major.to_i >= 6 ? "service=" : "" %>ssh
-authconfig --useshadow --enablemd5
+authconfig --useshadow --passalgo=sha256 --kickstart
 timezone UTC
-<% if @host.operatingsystem.name == "Fedora" -%>
-repo --name=fedora-everything --mirrorlist=https://mirrors.fedoraproject.org/metalink?repo=fedora-<%= @host.operatingsystem.major %>&arch=<%= @host.architecture %>
-<% end -%>
-<% if @host.operatingsystem.name == "Fedora" and @host.operatingsystem.major.to_i <= 16 -%>
-# Bootloader exception for Fedora 16:
-bootloader --append="nofb quiet splash=quiet <%=ks_console%>" <%= grub_pass %>
-part biosboot --fstype=biosboot --size=1
-<% else -%>
+services --disabled autofs,gpm,sendmail,cups,iptables,ip6tables,auditd,arptables_jf,xfs,pcmcia,isdn,rawdevices,hpoj,bluetooth,openibd,avahi-daemon,avahi-dnsconfd,hidd,hplip,pcscd,restorecond,mcstrans,rhnsd,yum-updatesd
+
 bootloader --location=mbr --append="nofb quiet splash=quiet" <%= grub_pass %>
-<% end -%>
-<% if @host.os.name == "RedHat" -%>
 key --skip
-<% end -%>
 
 <% if @dynamic -%>
 %include /tmp/diskpart.cfg
 <% else -%>
 <%= @host.diskLayout %>
 <% end -%>
+
 text
 reboot
 
-%packages
+%packages --ignoremissing
 yum
 dhclient
 ntp
 wget
 @Core
-<%= "%end\n" if @host.operatingsystem.name == "Fedora" %>
 
 <% if @dynamic -%>
 %pre
@@ -68,7 +63,6 @@ exec < /dev/tty3 > /dev/tty3
 cp -va /etc/resolv.conf /mnt/sysimage/etc/resolv.conf
 /usr/bin/chvt 1
 ) 2>&1 | tee /mnt/sysimage/root/install.postnochroot.log
-<%= "%end\n" if @host.operatingsystem.name == "Fedora" %>
 
 %post
 logger "Starting anaconda <%= @host %> postinstall"
@@ -81,8 +75,7 @@ echo "updating system time"
 /usr/sbin/ntpdate -sub <%= @host.params["ntp-server"] || "0.fedora.pool.ntp.org" %>
 /usr/sbin/hwclock --systohc
 
-# install epel if we can
-<%= snippet "epel" %>
+<%= snippets "redhat_register" %>
 
 # update all the base packages from the updates repository
 yum -t -y -e 0 update
@@ -98,15 +91,9 @@ EOF
 # Setup puppet to run on system reboot
 /sbin/chkconfig --level 345 puppet on
 
-# Disable most things. Puppet will activate these if required.
-echo "Disabling various system services"
-<% %w{autofs gpm sendmail cups iptables ip6tables auditd arptables_jf xfs pcmcia isdn rawdevices hpoj bluetooth openibd avahi-daemon avahi-dnsconfd hidd hplip pcscd restorecond mcstrans rhnsd yum-updatesd}.each do |service| -%>
-  /sbin/chkconfig --level 345 <%= service %> off 2>/dev/null
-  <% end -%>
+/usr/bin/puppet agent --config /etc/puppet/puppet.conf -o --tags no_such_tag --server <%= @host.puppetmaster %>  --no-daemonize
 
-  /usr/bin/puppet agent --config /etc/puppet/puppet.conf -o --tags no_such_tag --server <%= @host.puppetmaster %>  --no-daemonize
-
-  sync
+sync
 
 # Inform the build system that we are done.
 echo "Informing Foreman that we are built"
@@ -114,8 +101,6 @@ wget -q -O /dev/null --no-check-certificate <%= foreman_url %>
 # Sleeping an hour for debug
 ) 2>&1 | tee /root/install.post.log
 exit 0
-
-<%= "%end\n" if @host.operatingsystem.name == "Fedora" -%>
 '
 pxe_text='default linux
 label linux
@@ -134,14 +119,16 @@ Setting[:manage_puppetca] = false
 Setting[:foreman_url] = Facter.fqdn
 
 # Create an OS to assign things to. We'll come back later to finish it's config
-os = Operatingsystem.where(:name => "CentOS", :major => "6", :minor => "4").first
-os ||= Operatingsystem.create(:name => "CentOS", :major => "6", :minor => "4")
+os = Operatingsystem.where(:name => "RedHat", :major => "6", :minor => "4").first
+os ||= Operatingsystem.create(:name => "RedHat", :major => "6", :minor => "4")
 os.type = "Redhat"
 os.save!
 
 # Installation Media - comes as standard, just need to associate it
-m=Medium.find_or_create_by_name("Openstack RHEL mirror")
-m.path="http://mirror.ox.ac.uk/sites/mirror.centos.org/$major.$minor/os/$arch"
+# For RHEL this is the Binary DVD image from rhn.redhat.com downloads, loopback
+# mounted and made available over HTTP.
+m=Medium.find_or_create_by_name("OpenStack RHEL mirror")
+m.path="http://mirror.example.com/rhel/$major.$minor/os/$arch"
 m.os_family="Redhat"
 m.operatingsystems << os
 m.save!
@@ -164,19 +151,19 @@ end
 # Figure out how to call this before the class import
 # SmartProxy.new(:name => "OpenStack Smart Proxy", :url => "https://#{Facter.fqdn}:8443"
 
-# Architecures
+# Architectures
 a=Architecture.find_or_create_by_name "x86_64"
 a.operatingsystems << os
 a.save!
 
 # Domains
 d=Domain.find_or_create_by_name Facter.domain
-d.fullname="Openstack: #{Facter.domain}"
+d.fullname="OpenStack: #{Facter.domain}"
 d.dns = Feature.find_by_name("DNS").smart_proxies.first
 d.save!
 
 # Subnets - use Import Subnet code
-s=Subnet.find_or_create_by_name "Openstack"
+s=Subnet.find_or_create_by_name "OpenStack"
 s.network=Facter.send "network_#{private_int}"
 s.mask=Facter.send "netmask_#{private_int}"
 s.dhcp = Feature.find_by_name("DHCP").smart_proxies.first
@@ -186,7 +173,7 @@ s.domains=[d]
 s.save!
 
 # Templates
-pt   = Ptable.find_or_initialize_by_name "Openstack Disk Layout"
+pt   = Ptable.find_or_initialize_by_name "OpenStack Disk Layout"
 data = {
   :layout           => ptable_text,
   :os_family        => "Redhat"
@@ -194,7 +181,7 @@ data = {
 pt.update_attributes(data)
 pt.save!
 
-pxe = ConfigTemplate.find_or_initialize_by_name "Openstack PXE Template"
+pxe = ConfigTemplate.find_or_initialize_by_name "OpenStack PXE Template"
 data = {
   :template         => pxe_text,
   :operatingsystems => ( pxe.operatingsystems << os ).uniq,
@@ -204,7 +191,7 @@ data = {
 pxe.update_attributes(data)
 pxe.save!
 
-ks = ConfigTemplate.find_or_initialize_by_name "Openstack Kickstart Template"
+ks = ConfigTemplate.find_or_initialize_by_name "OpenStack Kickstart Template"
 data = {
   :template         => provision_text,
   :operatingsystems => ( ks.operatingsystems << os ).uniq,
